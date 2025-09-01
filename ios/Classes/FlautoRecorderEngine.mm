@@ -206,61 +206,73 @@
 
         //AVAudioFormat* commonFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:44100 channels:2 interleaved:NO];
 
-         [inputNode installTapOnBus: 0 bufferSize: (int)bufferSize format: nil block:
-          
-         ^(AVAudioPCMBuffer * _Nonnull buffer, AVAudioTime * _Nonnull when)
-         {
-                 
-                 inputStatus = AVAudioConverterInputStatus_HaveData ;
-                 AVAudioPCMBuffer* convertedBuffer = [[AVAudioPCMBuffer alloc]initWithPCMFormat: recordingFormat frameCapacity: [buffer frameCapacity]];
+    [inputNode installTapOnBus: 0 bufferSize: (int)bufferSize format: nil block:
+            ^(AVAudioPCMBuffer * _Nonnull buffer, AVAudioTime * _Nonnull when)
+            {
+                // 关键修复：添加多重保护
+                if (!flautoRecorder || status == 0) {
+                    return;  // 如果录音器已销毁或已停止，直接返回
+                }
 
+                // 使用 try-catch 保护整个回调
+                @try {
+                    inputStatus = AVAudioConverterInputStatus_HaveData;
+                    AVAudioPCMBuffer* convertedBuffer = [[AVAudioPCMBuffer alloc]initWithPCMFormat: recordingFormat frameCapacity: [buffer frameCapacity]];
 
-                 AVAudioConverterInputBlock inputBlock =
-                 ^AVAudioBuffer*(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus)
-                 {
-                         *outStatus = inputStatus;
-                         inputStatus =  AVAudioConverterInputStatus_NoDataNow;
-                         return buffer;
-                 };
-                 NSError* error;
-                 BOOL r = [converter convertToBuffer: convertedBuffer error: &error withInputFromBlock: inputBlock];
-                 if (!r)
-                 {
-                         //NSString* s =  error.localizedDescription;
-                         
-                         //s = error.localizedFailureReason;
-                         //[flautoRecorder logDebug: s];
-                         //return;
-                 }
-                 
-                 int n = [convertedBuffer frameLength];
-                 int16_t *const  bb = [convertedBuffer int16ChannelData][0];
-                 NSData* b = [[NSData alloc] initWithBytes: bb length: n * 2 ];
-                 if (n > 0)
-                 {
-                         if (fileHandle != nil)
-                         {
-                                 [fileHandle writeData: b];
-                         } else
-                         {
-                                 dispatch_async(dispatch_get_main_queue(), 
-                                ^{
-                                         [flautoRecorder  recordingData: b];
-                                 });
-                          }
-                         
-                         int16_t* pt = [convertedBuffer int16ChannelData][0];
-                         for (int i = 0; i < [buffer frameLength]; ++pt, ++i)
-                         {
-                                 short curSample = *pt;
-                                 if ( curSample > maxAmplitude )
-                                 {
-                                         maxAmplitude = curSample;
-                                 }
-                 
-                         }
-                 }
-         }];
+                    AVAudioConverterInputBlock inputBlock =
+                            ^AVAudioBuffer*(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus)
+                            {
+                                *outStatus = inputStatus;
+                                inputStatus = AVAudioConverterInputStatus_NoDataNow;
+                                return buffer;
+                            };
+
+                    NSError* error;
+                    BOOL r = [converter convertToBuffer: convertedBuffer error: &error withInputFromBlock: inputBlock];
+                    if (!r) {
+                        // 转换失败，直接返回
+                        return;
+                    }
+
+                    int n = [convertedBuffer frameLength];
+                    if (n <= 0) {
+                        return;  // 没有数据，直接返回
+                    }
+
+                    int16_t *const bb = [convertedBuffer int16ChannelData][0];
+                    if (!bb) {
+                        return;  // 数据指针无效，直接返回
+                    }
+
+                    NSData* b = [[NSData alloc] initWithBytes: bb length: n * 2];
+
+                    if (fileHandle != nil) {
+                        [fileHandle writeData: b];
+                    } else if (flautoRecorder) {  // 再次检查录音器是否有效
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            // 在主线程中再次检查状态
+                            if (flautoRecorder && status != 0) {
+                                [flautoRecorder recordingData: b];
+                            }
+                        });
+                    }
+
+                    // 计算音量峰值
+                    int16_t* pt = [convertedBuffer int16ChannelData][0];
+                    if (pt) {  // 确保指针有效
+                        for (int i = 0; i < n; ++pt, ++i) {
+                            short curSample = *pt;
+                            if (curSample > maxAmplitude) {
+                                maxAmplitude = curSample;
+                            }
+                        }
+                    }
+
+                } @catch (NSException *exception) {
+                    // 捕获所有异常，防止崩溃
+                    NSLog(@"音频回调异常: %@", exception.reason);
+                }
+            }];
      
 }
 
@@ -273,15 +285,48 @@ void AudioRecorderEngine::startRecorder()
 
 void AudioRecorderEngine::stopRecorder()
 {
-        [engine stop];
-        [fileHandle closeFile];
-        if (previousTS != 0)
-        {
-                dateCumul += CACurrentMediaTime() * 1000 - previousTS;
-                previousTS = 0;
+    if (status == 0) return;  // 已经停止
+
+    status = 0;  // 立即设置状态，阻止回调继续执行
+
+    if (engine) {
+        @try {
+            // 先移除 tap，这是最关键的
+            if ([engine inputNode]) {
+                [[engine inputNode] removeTapOnBus:0];
+            }
+        } @catch (NSException *e) {
+            NSLog(@"移除 tap 失败: %@", e.reason);
         }
-        status = 0;
+
+        // 短暂延迟，让正在执行的回调完成
+        usleep(50000);  // 50ms
+
+        @try {
+            [engine stop];
+        } @catch (NSException *e) {
+            NSLog(@"停止引擎失败: %@", e.reason);
+        }
+
         engine = nil;
+    }
+
+    if (fileHandle) {
+        @try {
+            [fileHandle closeFile];
+        } @catch (NSException *e) {
+            NSLog(@"关闭文件失败: %@", e.reason);
+        }
+        fileHandle = nil;
+    }
+
+    if (previousTS != 0) {
+        dateCumul += CACurrentMediaTime() * 1000 - previousTS;
+        previousTS = 0;
+    }
+
+    // 清空录音器引用，防止回调继续访问
+    flautoRecorder = nil;
 }
 
 void AudioRecorderEngine::resumeRecorder()
